@@ -24,18 +24,16 @@ X = StandardScaler().fit_transform(X).reshape(h, w, bands)
 pca = PCA(n_components=30)
 X_pca = pca.fit_transform(X.reshape(-1, bands)).reshape(h, w, 30)
 
-# === Patch extraction ===
+# === Patch extraction including class 0 ===
 def extract_patches(data, labels, patch_size=25):
     margin = patch_size // 2
     data_patches, patch_labels = [], []
     for i in range(margin, h - margin):
         for j in range(margin, w - margin):
             label = labels[i, j]
-            if label == 0:
-                continue
             patch = data[i-margin:i+margin+1, j-margin:j+margin+1, :]
             data_patches.append(patch)
-            patch_labels.append(label - 1)
+            patch_labels.append(label)  # keep label 0
     return np.array(data_patches), np.array(patch_labels)
 
 patch_size = 25
@@ -58,11 +56,11 @@ train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size
 
 # === Class weights ===
 class_counts = Counter(y_train.numpy())
-weights = torch.tensor([1.0 / class_counts[i] for i in range(len(class_counts))])
+weights = torch.tensor([1.0 / class_counts.get(i, 1) for i in range(17)])
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 weights = weights.to(device)
 
-# === CNN Model ===
+# === Residual CNN ===
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dilation=1):
         super().__init__()
@@ -100,7 +98,7 @@ class ImprovedCNN2D(nn.Module):
         x = self.dropout(x)
         return self.fc(x)
 
-n_classes = len(np.unique(y_patches))
+n_classes = 17  # 0 to 16
 model = ImprovedCNN2D(in_channels=X_train.shape[1], num_classes=n_classes).to(device)
 
 # === Training ===
@@ -139,7 +137,7 @@ with torch.no_grad():
     plt.savefig("indian_pines_confusion_matrix.png")
     plt.show()
 
-# === Predict only labeled pixels ===
+# === Predict all pixels ===
 pad_width = ((margin, margin), (margin, margin), (0, 0))
 X_padded = np.pad(X_pca, pad_width, mode='reflect')
 pred_map = np.zeros((h, w), dtype=np.uint8)
@@ -148,28 +146,26 @@ model.eval()
 with torch.no_grad():
     for i in range(h):
         for j in range(w):
-            if labels[i, j] == 0:
-                continue
             patch = X_padded[i:i + 2 * margin + 1, j:j + 2 * margin + 1, :]
             patch_tensor = torch.tensor(patch, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
             pred = model(patch_tensor).argmax(1).item()
-            pred_map[i, j] = pred + 1
+            pred_map[i, j] = pred
 
 # === Visualization ===
-colors = np.random.rand(n_classes + 1, 3)
-colors[0] = [0, 0, 0]  # black background
+colors = np.random.rand(n_classes, 3)
+colors[0] = [0.5, 0.5, 0.5]  # gray for class 0 instead of black
 cmap = ListedColormap(colors)
 
 fig, axs = plt.subplots(1, 2, figsize=(14, 6))
 
 axs[0].imshow(labels, cmap=cmap)
-axs[0].set_title("Ground Truth")
+axs[0].set_title("Ground Truth (with Class 0)")
 axs[0].axis('off')
 
 axs[1].imshow(pred_map, cmap=cmap)
-axs[1].set_title("Predicted Classes (Improved CNN2D)")
+axs[1].set_title("Predicted Classes (All Pixels)")
 axs[1].axis('off')
 
 plt.tight_layout()
-plt.savefig("indian_pines_full_prediction_improved.png")
+plt.savefig("indian_pines_full_prediction_with_class0.png")
 plt.show()
