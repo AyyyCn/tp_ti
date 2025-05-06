@@ -13,9 +13,9 @@ import seaborn as sns
 from matplotlib.colors import ListedColormap
 from collections import Counter
 
-# === Load Indian Pines ===
-data = scipy.io.loadmat('Indian_pines_corrected.mat')['indian_pines_corrected']
-labels = scipy.io.loadmat('Indian_pines_gt.mat')['indian_pines_gt']
+# === Load Pavia University ===
+data = scipy.io.loadmat('PaviaU.mat')['paviaU']
+labels = scipy.io.loadmat('PaviaU_gt.mat')['paviaU_gt']
 h, w, bands = data.shape
 X = data.reshape(-1, bands)
 X = StandardScaler().fit_transform(X).reshape(h, w, bands)
@@ -24,24 +24,27 @@ X = StandardScaler().fit_transform(X).reshape(h, w, bands)
 pca = PCA(n_components=30)
 X_pca = pca.fit_transform(X.reshape(-1, bands)).reshape(h, w, 30)
 
-# === Patch extraction including class 0 ===
-def extract_patches(data, labels, patch_size=25):
+# === Extract patches BUT skip class 0 during training
+def extract_patches(data, labels, patch_size=25, skip_zero=True):
     margin = patch_size // 2
     data_patches, patch_labels = [], []
     for i in range(margin, h - margin):
         for j in range(margin, w - margin):
             label = labels[i, j]
+            if skip_zero and label == 0:
+                continue
             patch = data[i-margin:i+margin+1, j-margin:j+margin+1, :]
             data_patches.append(patch)
-            patch_labels.append(label)  # keep label 0
+            patch_labels.append(label - 1 if skip_zero else label)
     return np.array(data_patches), np.array(patch_labels)
 
+# Extract labeled data for training
 patch_size = 25
 margin = patch_size // 2
-X_patches, y_patches = extract_patches(X_pca, labels)
-print("Patches:", X_patches.shape)
+X_patches, y_patches = extract_patches(X_pca, labels, patch_size=patch_size, skip_zero=True)
+print("Training Patches:", X_patches.shape)
 
-# === Train/test split ===
+# === Train/test split
 X_train, X_test, y_train, y_test = train_test_split(
     X_patches, y_patches, test_size=0.3, stratify=y_patches, random_state=42
 )
@@ -50,17 +53,18 @@ X_test = torch.tensor(X_test).permute(0, 3, 1, 2).float()
 y_train = torch.tensor(y_train).long()
 y_test = torch.tensor(y_test).long()
 
-# === DataLoader ===
+# === DataLoader
 batch_size = 64
 train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
 
-# === Class weights ===
+# === Class weights (exclude class 0)
+num_true_classes = np.max(labels)  # e.g. 9 for PaviaU
 class_counts = Counter(y_train.numpy())
-weights = torch.tensor([1.0 / class_counts.get(i, 1) for i in range(17)])
+weights = torch.tensor([1.0 / class_counts.get(i, 1) for i in range(num_true_classes)]).to(torch.float32)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 weights = weights.to(device)
 
-# === Residual CNN ===
+# === Residual CNN
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dilation=1):
         super().__init__()
@@ -98,10 +102,9 @@ class ImprovedCNN2D(nn.Module):
         x = self.dropout(x)
         return self.fc(x)
 
-n_classes = 17  # 0 to 16
-model = ImprovedCNN2D(in_channels=X_train.shape[1], num_classes=n_classes).to(device)
+model = ImprovedCNN2D(X_train.shape[1], num_classes=num_true_classes).to(device)
 
-# === Training ===
+# === Training
 loss_fn = nn.CrossEntropyLoss(weight=weights)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
@@ -120,7 +123,7 @@ for epoch in range(25):
         total += batch_y.size(0)
     print(f"Epoch {epoch+1} - Loss: {total_loss:.4f} - Train Acc: {correct / total:.4f}")
 
-# === Evaluation ===
+# === Evaluation
 model.eval()
 with torch.no_grad():
     preds = model(X_test.to(device)).argmax(1).cpu()
@@ -134,10 +137,10 @@ with torch.no_grad():
     plt.ylabel("True")
     plt.title("Confusion Matrix")
     plt.tight_layout()
-    plt.savefig("indian_pines_confusion_matrix.png")
+    plt.savefig("paviau_confusion_matrix.png")
     plt.show()
 
-# === Predict all pixels ===
+# === Predict all pixels (including class 0)
 pad_width = ((margin, margin), (margin, margin), (0, 0))
 X_padded = np.pad(X_pca, pad_width, mode='reflect')
 pred_map = np.zeros((h, w), dtype=np.uint8)
@@ -149,15 +152,18 @@ with torch.no_grad():
             patch = X_padded[i:i + 2 * margin + 1, j:j + 2 * margin + 1, :]
             patch_tensor = torch.tensor(patch, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
             pred = model(patch_tensor).argmax(1).item()
-            pred_map[i, j] = pred
+            pred_map[i, j] = pred + 1  # shift back because class 0 was excluded
 
-# === Visualization ===
-colors = np.random.rand(n_classes, 3)
-colors[0] = [0.5, 0.5, 0.5]  # gray for class 0 instead of black
+# Set background (originally 0) back to 0
+pred_map[labels == 0] = 0
+
+# === Visualization
+n_classes_total = num_true_classes + 1  # Add class 0 back
+colors = np.random.rand(n_classes_total, 3)
+colors[0] = [0.5, 0.5, 0.5]  # gray for background
 cmap = ListedColormap(colors)
 
 fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-
 axs[0].imshow(labels, cmap=cmap)
 axs[0].set_title("Ground Truth (with Class 0)")
 axs[0].axis('off')
@@ -167,5 +173,5 @@ axs[1].set_title("Predicted Classes (All Pixels)")
 axs[1].axis('off')
 
 plt.tight_layout()
-plt.savefig("indian_pines_full_prediction_with_class0.png")
+plt.savefig("paviau_full_prediction_with_class0.png")
 plt.show()
